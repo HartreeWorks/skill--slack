@@ -15,7 +15,7 @@ If `config.json` is missing when running a Slack command, walk the user through 
 
 1. **Create config file:**
    ```bash
-   cd ~/.claude/skills/slack
+   cd ~/.agents/skills/slack
    cp config.example.json config.json
    ```
 
@@ -46,7 +46,7 @@ If `config.json` is missing when running a Slack command, walk the user through 
 
 4. **Add the workspace using the CLI:**
    ```bash
-   SCRIPT=~/.claude/skills/slack/scripts/slack_client.py
+   SCRIPT=~/.agents/skills/slack/scripts/slack_client.py
    python3 $SCRIPT add-workspace "workspace-name" "xoxc-token" "xoxd-token" "user-agent"
    ```
 
@@ -99,7 +99,7 @@ The `user_agent` is optional when adding subsequent workspaces (defaults to firs
 ### Test the Connection
 
 ```bash
-python3 ~/.claude/skills/slack/scripts/slack_client.py auth
+python3 ~/.agents/skills/slack/scripts/slack_client.py auth
 ```
 
 ## CRITICAL: User ID Resolution
@@ -163,6 +163,90 @@ python3 $SCRIPT -w 80000hours replies "C039MDQ91" "1767837883.421009"
 
 ---
 
+## CRITICAL: Slack Connect (External) Users
+
+**Slack's `from:username` search does NOT work for Slack Connect (external) users.** These are people who belong to another workspace but participate in shared channels on your workspace. Their user IDs belong to the external workspace, so `search "from:username"` returns zero results even though they've posted messages.
+
+### How to Identify Slack Connect Users
+
+Slack Connect users appear on shared channels. When listing channels, shared channels have `is_shared: true` or `is_ext_shared: true`. External users' messages in channel history include an embedded `user_profile` with fields like `real_name`, `display_name`, and `team` (their home workspace ID, different from yours).
+
+### Finding Messages from Slack Connect Users
+
+Since search won't work, use channel history instead:
+
+1. **Identify the relevant shared channel(s):**
+   ```bash
+   python3 $SCRIPT channels "public_channel,private_channel"
+   ```
+   Look for channels with `is_shared: true` or `is_ext_shared: true` that are likely to contain the person's messages (e.g., a channel named `client--forethought--*` for a Forethought employee).
+
+2. **Fetch channel history and filter by user ID:**
+   ```bash
+   python3 $SCRIPT history "C084G9PKYGN" 100
+   ```
+   Then filter the JSON for messages from the target user ID. External users' messages include `user_profile.real_name` and `user_profile.display_name` inline, so you can identify them even without `user-lookup`.
+
+3. **If you don't know the user ID yet**, scan the channel history for messages where `user_profile.display_name` or `user_profile.real_name` matches the person's name.
+
+### Example
+
+```bash
+# 1. Find the shared Forethought channel
+python3 $SCRIPT channels "public_channel,private_channel"
+# Look for: C084G9PKYGN client--forethought--ai-tips-and-tricks (shared=True)
+
+# 2. Fetch history and filter for the external user
+python3 $SCRIPT history "C084G9PKYGN" 100
+# Filter results for messages where user_profile.display_name == "Fin"
+```
+
+### Key Gotcha
+
+The `user-lookup` command only returns users who are **members of your workspace**. Slack Connect users will NOT appear in the lookup. Instead, rely on the `user_profile` embedded in their messages within shared channels.
+
+---
+
+## CRITICAL: Ambiguous User Names
+
+When the user asks for messages "from [name]", there may be **multiple people matching that name** across workspace members and Slack Connect users. You MUST check for ambiguity before returning results.
+
+### Mandatory Disambiguation Workflow
+
+1. **Check workspace members** via `user-lookup` or `users` for name matches.
+2. **Check Slack Connect channels** for external users with matching names. Look at shared channels whose names suggest a relevant organisation.
+3. **If multiple matches exist**, use AskUserQuestion to clarify:
+
+```
+question: "I found multiple people matching that name. Which one?"
+header: "Which [name]?"
+options:
+  - label: "[Full Name 1]"
+    description: "[email or org] — workspace member"
+  - label: "[Full Name 2]"
+    description: "[email or org] — Slack Connect, #channel-name"
+multiSelect: false
+```
+
+4. **If the user provides an email or organisation** (e.g., "fin@forethought.org"), use that to narrow down:
+   - Check workspace member emails from the `users` command output
+   - Check shared channel names for org references (e.g., `client--forethought--*`)
+   - Check `user_profile.team` in shared channel messages
+
+### What NOT To Do
+
+- Do not assume the first `from:username` search result is the right person
+- Do not ignore Slack Connect users just because they don't appear in search or user-lookup
+- Do not return results from the wrong person without flagging the ambiguity
+
+### What To Do
+
+- Always consider whether the target person might be a Slack Connect user, especially if an external email/org is mentioned
+- When an org name is mentioned, look for shared channels named `client--[org]--*`
+- If in doubt, ask — a wrong attribution is worse than an extra clarification step
+
+---
+
 ## Python Client Commands
 
 The `scripts/slack_client.py` script provides these commands. All commands support an optional `-w <workspace>` flag to specify the workspace.
@@ -193,7 +277,7 @@ The `scripts/slack_client.py` script provides these commands. All commands suppo
 ### Example Usage
 
 ```bash
-SCRIPT=~/.claude/skills/slack/scripts/slack_client.py
+SCRIPT=~/.agents/skills/slack/scripts/slack_client.py
 
 # List configured workspaces
 python3 $SCRIPT workspaces
@@ -264,12 +348,12 @@ This enables automatic workspace inference when operating on previously-seen cha
 
 ## Performance Cache
 
-Each workspace has its own cache file (`slack-cache-{workspace}.json`) storing frequently-used IDs.
+Each workspace has its own cache file (`data/slack-cache-{workspace}.json`) storing frequently-used IDs.
 
 ### Using the Cache
 
 Before making API calls to look up users or channels:
-1. Read `slack-cache-{workspace}.json` for the current workspace
+1. Read `data/slack-cache-{workspace}.json` for the current workspace
 2. Check if the needed ID is already cached
 3. If found, use the cached value directly
 4. If not found, make the API call, then update the cache
@@ -446,7 +530,7 @@ People: [names involved]
 
 ### Message Index File
 
-After generating the digest, write `~/.claude/skills/slack/last-digest.json`:
+After generating the digest, write `~/.agents/skills/slack/last-digest.json`:
 
 ```json
 {
@@ -535,7 +619,7 @@ Export the user's sent messages with full thread context to a JSON file. Support
 ### Basic export
 
 ```bash
-SCRIPT=~/.claude/skills/slack/scripts/slack_client.py
+SCRIPT=~/.agents/skills/slack/scripts/slack_client.py
 
 # Export last 6 months of messages
 python3 $SCRIPT export --from 2025-07-01 --to 2026-01-05 --output ~/slack-export.json

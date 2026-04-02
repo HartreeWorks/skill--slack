@@ -1,9 +1,6 @@
-# Credentials and personal data - do not commit
-config.json
-slack-cache-*.json
-session-state.json
-last-digest.json
-
 # Copy from example files to get started:
 #   cp config.example.json config.json
 __pycache__/
+
+# Private local data (not published)
+data/

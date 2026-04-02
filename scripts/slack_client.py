@@ -314,7 +314,7 @@ def infer_workspace_from_channel(channel_id: str) -> str | None:
 
 def get_cache_path(workspace: str) -> Path:
     """Get the cache file path for a specific workspace."""
-    return SKILL_ROOT / f"slack-cache-{workspace}.json"
+    return SKILL_ROOT / "data" / f"slack-cache-{workspace}.json"
 
 
 def load_cache(workspace: str) -> dict:
@@ -845,7 +845,7 @@ def load_digest_config() -> dict:
         return {
             "workspaces": {},
             "lookback_hours": 14,
-            "output_dir": str(SKILL_ROOT / "digests")
+            "output_dir": str(SKILL_ROOT / "data" / "digests")
         }
     with open(DIGEST_CONFIG_PATH) as f:
         return json.load(f)
@@ -1119,7 +1119,7 @@ def write_digest_output(digest: dict, output_dir: str = None) -> str:
     """
     if not output_dir:
         digest_config = load_digest_config()
-        output_dir = digest_config.get("output_dir", str(SKILL_ROOT / "digests"))
+        output_dir = digest_config.get("output_dir", str(SKILL_ROOT / "data" / "digests"))
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
