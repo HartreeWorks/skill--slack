@@ -24,6 +24,11 @@ SESSION_STATE_PATH = SKILL_ROOT / "session-state.json"
 DIGEST_CONFIG_PATH = SKILL_ROOT / "digest-config.json"
 
 
+def slack_ts_value(timestamp: str) -> int:
+    """Convert Slack's fixed six-decimal timestamp to an exactly comparable integer."""
+    return int(timestamp.replace(".", ""))
+
+
 # ==================== Rate Limiter ====================
 
 class RateLimiter:
@@ -126,7 +131,12 @@ class SlackClient:
         })
 
     def _post(self, endpoint: str, data: dict = None) -> dict:
-        """Make authenticated POST request with stealth fields."""
+        """Make authenticated POST request with stealth fields.
+
+        Retries transparently on HTTP 429 / "ratelimited" errors, honouring
+        Retry-After. Each CLI invocation is its own process, so per-request
+        retry is the only rate-limit defence that works across invocations.
+        """
         payload = {
             "token": self.token,
             "_x_reason": "api-call",
@@ -136,36 +146,134 @@ class SlackClient:
             **(data or {})
         }
 
-        response = self.session.post(
-            f"{self.BASE_URL}/{endpoint}",
-            data=payload,
-            cookies=self.cookies
-        )
-        return response.json()
+        last_result = {"ok": False, "error": "ratelimited"}
+        for attempt in range(6):
+            response = self.session.post(
+                f"{self.BASE_URL}/{endpoint}",
+                data=payload,
+                cookies=self.cookies
+            )
+            retry_after = response.headers.get("Retry-After")
+            if response.status_code == 429:
+                wait = int(retry_after) if retry_after and retry_after.isdigit() else 15 * (attempt + 1)
+                print(f"  {endpoint}: HTTP 429, retrying in {wait}s", file=sys.stderr)
+                time.sleep(min(wait, 120))
+                continue
+            try:
+                result = response.json()
+            except ValueError:
+                return {"ok": False, "error": f"Non-JSON response (status {response.status_code})"}
+            if result.get("ok") is False and result.get("error") == "ratelimited":
+                wait = int(retry_after) if retry_after and retry_after.isdigit() else 15 * (attempt + 1)
+                print(f"  {endpoint}: ratelimited, retrying in {wait}s", file=sys.stderr)
+                last_result = result
+                time.sleep(min(wait, 120))
+                continue
+            return result
+        return last_result
 
     # ==================== Core Functions ====================
 
     def channels_list(self, types: str = "public_channel,private_channel,im,mpim",
                       limit: int = 200) -> dict:
-        """List channels, DMs, and group DMs."""
-        return self._post("conversations.list", {
-            "types": types,
-            "limit": str(limit),
-            "exclude_archived": "true"
-        })
+        """List channels, DMs, and group DMs. Paginates so callers see every page."""
+        channels = []
+        cursor = None
+        result = {}
+        for _ in range(25):
+            data = {
+                "types": types,
+                "limit": str(limit),
+                "exclude_archived": "true"
+            }
+            if cursor:
+                data["cursor"] = cursor
+            result = self._post("conversations.list", data)
+            if not result.get("ok"):
+                return result
+            channels.extend(result.get("channels", []))
+            cursor = (result.get("response_metadata") or {}).get("next_cursor") or None
+            if not cursor:
+                break
+        result["channels"] = channels
+        return result
 
-    def conversations_history(self, channel: str, limit: int = 100) -> dict:
-        """Get message history from a channel or DM."""
-        return self._post("conversations.history", {
-            "channel": channel,
-            "limit": str(limit)
-        })
+    def conversations_history(self, channel: str, limit: int = 100, oldest: str = None,
+                              latest: str = None, cursor: str = None) -> dict:
+        """Get message history from a channel or DM, optionally bounded and paginated."""
+        data = {"channel": channel, "limit": str(limit)}
+        if oldest:
+            data["oldest"] = oldest
+        if latest:
+            data["latest"] = latest
+            data["inclusive"] = "true"
+        if cursor:
+            data["cursor"] = cursor
+        return self._post("conversations.history", data)
+
+    def client_counts(self) -> dict:
+        """Get per-conversation read cursors, latest timestamps and unread flags in one call."""
+        return self._post("client.counts", {})
+
+    def download_file(self, url: str, output_path: str, max_bytes: int = 4 * 1024 * 1024) -> dict:
+        """Download an authenticated Slack image file (url_private) to output_path."""
+        if not url.startswith("https://files.slack.com/"):
+            return {"ok": False, "error": "Only files.slack.com URLs are supported"}
+        response = self.session.get(
+            url,
+            cookies=self.cookies,
+            headers={"Content-Type": None},
+            stream=True,
+            timeout=60,
+        )
+        content_type = response.headers.get("Content-Type", "")
+        if response.status_code != 200 or not content_type.startswith("image/"):
+            return {
+                "ok": False,
+                "error": f"Unexpected response: status={response.status_code} type={content_type}",
+            }
+        total = 0
+        try:
+            with open(output_path, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=65536):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"File exceeds {max_bytes} byte cap")
+                    handle.write(chunk)
+        except ValueError as exc:
+            Path(output_path).unlink(missing_ok=True)
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "path": output_path, "bytes": total, "content_type": content_type}
+
+    def conversations_info(self, channel: str) -> dict:
+        """Get conversation metadata, including the authenticated user's read cursor."""
+        return self._post("conversations.info", {"channel": channel})
 
     def conversations_replies(self, channel: str, thread_ts: str) -> dict:
         """Get replies in a thread."""
         return self._post("conversations.replies", {
             "channel": channel,
             "ts": thread_ts
+        })
+
+    def thread_view(self, limit: int = 20, current_ts: str = None) -> dict:
+        """Read the Threads view (subscribed threads, newest reply first).
+
+        Internal web-client endpoint; read-only. Each thread carries
+        `root_msg` (with the caller's `last_read` and `latest_reply`) and
+        `latest_replies` (the newest few replies only). Page older threads by
+        passing the previous page's oldest `latest_reply` as `current_ts`.
+        """
+        data = {"limit": str(limit), "org_wide_aware": "true"}
+        if current_ts:
+            data["current_ts"] = current_ts
+        return self._post("subscriptions.thread.getView", data)
+
+    def conversations_mark(self, channel: str, message_ts: str) -> dict:
+        """Move the authenticated user's read cursor through a channel timestamp."""
+        return self._post("conversations.mark", {
+            "channel": channel,
+            "ts": message_ts,
         })
 
     def search_messages(self, query: str, count: int = 20, sort: str = "timestamp") -> dict:
@@ -225,9 +333,9 @@ class SlackClient:
         Generate a permalink for a message.
 
         Args:
-            channel: Channel ID (e.g., C04AFNMCNFP)
+            channel: Channel ID (e.g., C0123456789)
             message_ts: Message timestamp (e.g., 1734567890.123456)
-            workspace: Workspace name (e.g., "80000hours"). If not provided,
+            workspace: Workspace name (e.g., "hartreeworks"). If not provided,
                       fetches from auth.test API.
             link_style: "app" for native Slack app, "browser" for web browser.
                        - app: uses /archives/ path (opens in Slack app)
@@ -240,7 +348,7 @@ class SlackClient:
             auth = self.auth_test()
             if not auth.get("ok"):
                 raise ValueError(f"Failed to get workspace: {auth.get('error')}")
-            # Extract workspace from URL like "https://80000hours.slack.com/"
+            # Extract workspace from URL like "https://hartreeworks.slack.com/"
             url = auth.get("url", "")
             workspace = url.replace("https://", "").replace(".slack.com/", "")
 
@@ -1234,9 +1342,15 @@ def main():
                 "auth": "Test authentication",
                 "channels": "List channels (optional: types)",
                 "users": "List users",
-                "history": "Get channel history (channel_id, optional: limit)",
+                "history": "Get channel history (channel_id, optional: limit, --oldest ts, --latest ts, --cursor c)",
+                "counts": "Get read cursors, latest timestamps and unread flags for all conversations",
+                "download": "Download an authenticated Slack image (url, output_path, optional: max_bytes)",
+                "info": "Get conversation metadata including the caller's read cursor (channel_id)",
                 "replies": "Get thread replies (channel_id, thread_ts)",
+                "thread-view": "Read the Threads view: subscribed threads with read cursors (optional: limit, --current-ts ts)",
+                "mark-read": "Mark a channel read through a message timestamp (channel_id, message_ts, --confirm)",
                 "search": "Search messages (query, optional: count)",
+                "search-page": "Search messages with pagination, oldest first (query, page, optional: count)",
                 "send": "Send message (channel_id, text, optional: thread_ts)",
                 "permalink": "Get message permalink (channel_id, message_ts, optional: workspace, link_style)",
                 "workspaces": "List configured workspaces",
@@ -1565,8 +1679,58 @@ def main():
                 print(json.dumps({"error": "channel_id required"}))
                 sys.exit(1)
             channel = cmd_args[0]
-            limit = int(cmd_args[1]) if len(cmd_args) > 1 else 100
-            result = client.conversations_history(channel, limit)
+            options = {}
+            positional = []
+            index = 0
+            remaining = cmd_args[1:]
+            while index < len(remaining):
+                arg = remaining[index]
+                if arg in ("--oldest", "--latest", "--cursor"):
+                    if index + 1 >= len(remaining):
+                        print(json.dumps({"error": f"{arg} requires a value"}))
+                        sys.exit(1)
+                    options[arg[2:]] = remaining[index + 1]
+                    index += 2
+                    continue
+                if arg.startswith("--"):
+                    print(json.dumps({"error": f"Unknown option: {arg}"}))
+                    sys.exit(1)
+                positional.append(arg)
+                index += 1
+            limit = int(positional[0]) if positional else 100
+            result = client.conversations_history(
+                channel, limit,
+                oldest=options.get("oldest"),
+                latest=options.get("latest"),
+                cursor=options.get("cursor"),
+            )
+            if result.get("ok"):
+                set_active_workspace(ws_name)
+                record_channel_workspace(channel, ws_name)
+                result["_workspace"] = ws_name
+
+        elif command == "counts":
+            result = client.client_counts()
+            if result.get("ok"):
+                set_active_workspace(ws_name)
+                result["_workspace"] = ws_name
+
+        elif command == "download":
+            if len(cmd_args) < 2:
+                print(json.dumps({"error": "url and output_path required"}))
+                sys.exit(1)
+            max_bytes = int(cmd_args[2]) if len(cmd_args) > 2 else 4 * 1024 * 1024
+            result = client.download_file(cmd_args[0], cmd_args[1], max_bytes)
+            if result.get("ok"):
+                set_active_workspace(ws_name)
+                result["_workspace"] = ws_name
+
+        elif command == "info":
+            if not cmd_args:
+                print(json.dumps({"error": "channel_id required"}))
+                sys.exit(1)
+            channel = cmd_args[0]
+            result = client.conversations_info(channel)
             if result.get("ok"):
                 set_active_workspace(ws_name)
                 record_channel_workspace(channel, ws_name)
@@ -1583,6 +1747,59 @@ def main():
                 record_channel_workspace(channel, ws_name)
                 result["_workspace"] = ws_name
 
+        elif command == "thread-view":
+            limit = 20
+            current_ts = None
+            rest = list(cmd_args)
+            if rest and rest[0] != "--current-ts":
+                limit = int(rest.pop(0))
+            if len(rest) >= 2 and rest[0] == "--current-ts":
+                current_ts = rest[1]
+            result = client.thread_view(limit, current_ts)
+            if result.get("ok"):
+                set_active_workspace(ws_name)
+                result["_workspace"] = ws_name
+
+        elif command == "mark-read":
+            if len(cmd_args) != 3 or cmd_args[2] != "--confirm":
+                print(json.dumps({
+                    "error": "Explicit confirmation required",
+                    "usage": "mark-read <channel_id> <message_ts> --confirm",
+                }))
+                sys.exit(1)
+            channel, message_ts = cmd_args[0], cmd_args[1]
+            if not re.fullmatch(r"[A-Z][A-Z0-9]+", channel):
+                print(json.dumps({"error": "Invalid channel ID"}))
+                sys.exit(1)
+            if not re.fullmatch(r"\d{10,}\.\d{6}", message_ts):
+                print(json.dumps({"error": "Invalid Slack message timestamp"}))
+                sys.exit(1)
+            info = client.conversations_info(channel)
+            if not info.get("ok"):
+                result = info
+            else:
+                current_last_read = str((info.get("channel") or {}).get("last_read") or "")
+                if not re.fullmatch(r"\d{10,}\.\d{6}", current_last_read):
+                    print(json.dumps({
+                        "error": "Slack did not return a valid current read cursor; refusing to mark",
+                    }))
+                    sys.exit(1)
+                if slack_ts_value(current_last_read) >= slack_ts_value(message_ts):
+                    result = {
+                        "ok": True,
+                        "no_op": True,
+                        "current_last_read": current_last_read,
+                    }
+                else:
+                    result = client.conversations_mark(channel, message_ts)
+                    if result.get("ok"):
+                        result["previous_last_read"] = current_last_read
+            if result.get("ok"):
+                set_active_workspace(ws_name)
+                record_channel_workspace(channel, ws_name)
+                result["_workspace"] = ws_name
+                result["marked_through"] = message_ts
+
         elif command == "search":
             if not cmd_args:
                 print(json.dumps({"error": "query required"}))
@@ -1590,6 +1807,18 @@ def main():
             query = cmd_args[0]
             count = int(cmd_args[1]) if len(cmd_args) > 1 else 20
             result = client.search_messages(query, count)
+            if result.get("ok"):
+                set_active_workspace(ws_name)
+                result["_workspace"] = ws_name
+
+        elif command == "search-page":
+            if len(cmd_args) < 2:
+                print(json.dumps({"error": "query and page required"}))
+                sys.exit(1)
+            query = cmd_args[0]
+            page = int(cmd_args[1])
+            count = int(cmd_args[2]) if len(cmd_args) > 2 else 100
+            result = client.search_messages_paginated(query, page=page, count=count)
             if result.get("ok"):
                 set_active_workspace(ws_name)
                 result["_workspace"] = ws_name

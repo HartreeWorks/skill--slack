@@ -1,6 +1,6 @@
 ---
 name: slack
-description: This skill should be used when the user asks to send Slack messages, check notifications, get a Slack digest, or search message history. Supports multiple workspaces.
+description: Searches, digests, and sends Slack messages when the user asks to find, summarise, export, or post Slack content.
 ---
 
 # Slack Integration Skill
@@ -46,20 +46,21 @@ If `config.json` is missing when running a Slack command, walk the user through 
 
 4. **Add the workspace using the CLI:**
    ```bash
-   SCRIPT=~/.agents/skills/slack/scripts/slack_client.py
-   python3 $SCRIPT add-workspace "workspace-name" "xoxc-token" "xoxd-token" "user-agent"
+   SLACK=~/.agents/skills/slack/scripts/slack
+   $SLACK add-workspace "workspace-name" "xoxc-token" "xoxd-token" "user-agent"
    ```
 
 5. **Test the connection:**
    ```bash
-   python3 $SCRIPT auth
+   $SLACK auth
    ```
 
 ### Adding Additional Workspaces
 
 To add another workspace, repeat the token extraction for the new workspace and run:
 ```bash
-python3 $SCRIPT add-workspace "new-workspace" "xoxc-token" "xoxd-token"
+SLACK=~/.agents/skills/slack/scripts/slack
+$SLACK add-workspace "new-workspace" "xoxc-token" "xoxd-token"
 ```
 
 The `user_agent` is optional when adding subsequent workspaces (defaults to first workspace's value).
@@ -99,16 +100,22 @@ The `user_agent` is optional when adding subsequent workspaces (defaults to firs
 ### Test the Connection
 
 ```bash
-python3 ~/.agents/skills/slack/scripts/slack_client.py auth
+~/.agents/skills/slack/scripts/slack auth
+```
+
+For the examples below, use:
+
+```bash
+SLACK=~/.agents/skills/slack/scripts/slack
 ```
 
 ## CRITICAL: User ID Resolution
 
-**Slack API returns user IDs (e.g., `U02GYLM0A`), NOT display names.** You MUST resolve these IDs to names before presenting any Slack content to the user.
+**Slack API returns user IDs (e.g., `U0123456789`), NOT display names.** You MUST resolve these IDs to names before presenting any Slack content to the user.
 
 ### Why This Matters
 
-Guessing names from context is a **critical failure mode**. User IDs like `U7DTUK3U6` give no indication of who the person is. If you summarize a thread and attribute quotes to the wrong people, you're spreading misinformation.
+Guessing names from context is a **critical failure mode**. User IDs like `U9876543210` give no indication of who the person is. If you summarize a thread and attribute quotes to the wrong people, you're spreading misinformation.
 
 ### Mandatory Workflow
 
@@ -116,7 +123,7 @@ Guessing names from context is a **critical failure mode**. User IDs like `U7DTU
 
 1. **Get the user lookup for the workspace:**
    ```bash
-   python3 $SCRIPT -w <workspace> user-lookup
+   $SLACK -w <workspace> user-lookup
    ```
    This returns a JSON mapping of user_id → display_name.
 
@@ -138,15 +145,15 @@ That's it - just two steps. The `user-lookup` command handles caching automatica
 
 ```bash
 # 1. Get user lookup FIRST (handles caching automatically)
-python3 $SCRIPT -w 80000hours user-lookup
-# Returns: {"U02GYLM0A": "Benjamin Todd", "U7DTUK3U6": "Niel", ...}
+$SLACK -w hartreeworks user-lookup
+# Returns: {"U0123456789": "Alice Example", "U9876543210": "Bob Example", ...}
 # (First time: fetches from API. Later: uses cache, refreshes in background if >14 days old)
 
 # 2. Fetch a thread
-python3 $SCRIPT -w 80000hours replies "C039MDQ91" "1767837883.421009"
-# Returns messages with user IDs like "U02GYLM0A", "U7DTUK3U6"
+$SLACK -w hartreeworks replies "C0123456789" "1736789012.123456"
+# Returns messages with user IDs like "U0123456789", "U9876543210"
 
-# 3. Now you can correctly attribute: "Benjamin Todd said..." not "User U02GYLM0A said..."
+# 3. Now you can correctly attribute: "Alice Example said..." not "User U0123456789 said..."
 ```
 
 ### What NOT To Do
@@ -177,13 +184,13 @@ Since search won't work, use channel history instead:
 
 1. **Identify the relevant shared channel(s):**
    ```bash
-   python3 $SCRIPT channels "public_channel,private_channel"
+   $SLACK channels "public_channel,private_channel"
    ```
-   Look for channels with `is_shared: true` or `is_ext_shared: true` that are likely to contain the person's messages (e.g., a channel named `client--forethought--*` for a Forethought employee).
+   Look for channels with `is_shared: true` or `is_ext_shared: true` that are likely to contain the person's messages (e.g., a channel named `client--exampleco--*` for a ExampleCo employee).
 
 2. **Fetch channel history and filter by user ID:**
    ```bash
-   python3 $SCRIPT history "C084G9PKYGN" 100
+   $SLACK history "C0123456789" 100
    ```
    Then filter the JSON for messages from the target user ID. External users' messages include `user_profile.real_name` and `user_profile.display_name` inline, so you can identify them even without `user-lookup`.
 
@@ -192,13 +199,13 @@ Since search won't work, use channel history instead:
 ### Example
 
 ```bash
-# 1. Find the shared Forethought channel
-python3 $SCRIPT channels "public_channel,private_channel"
-# Look for: C084G9PKYGN client--forethought--ai-tips-and-tricks (shared=True)
+# 1. Find the shared ExampleCo channel
+$SLACK channels "public_channel,private_channel"
+# Look for: C0123456789 client--exampleco--ai-tips-and-tricks (shared=True)
 
 # 2. Fetch history and filter for the external user
-python3 $SCRIPT history "C084G9PKYGN" 100
-# Filter results for messages where user_profile.display_name == "Fin"
+$SLACK history "C0123456789" 100
+# Filter results for messages where user_profile.display_name == "Alice"
 ```
 
 ### Key Gotcha
@@ -228,9 +235,9 @@ options:
 multiSelect: false
 ```
 
-4. **If the user provides an email or organisation** (e.g., "fin@forethought.org"), use that to narrow down:
+4. **If the user provides an email or organisation** (e.g., "alice@example.com"), use that to narrow down:
    - Check workspace member emails from the `users` command output
-   - Check shared channel names for org references (e.g., `client--forethought--*`)
+   - Check shared channel names for org references (e.g., `client--exampleco--*`)
    - Check `user_profile.team` in shared channel messages
 
 ### What NOT To Do
@@ -249,6 +256,20 @@ multiSelect: false
 
 ## Python Client Commands
 
+**Important runtime note:** run the Slack client through the launcher, not by calling a Python executable directly. The launcher avoids stale virtualenv symlinks and system Python dependency gaps. Use:
+
+```bash
+SLACK=~/.agents/skills/slack/scripts/slack
+$SLACK auth
+```
+
+The launcher uses `~/.agents/skills/slack/.venv/bin/python` when it is present and healthy, then falls back to a working `python3`. If neither runtime has the required dependencies, repair the local virtualenv with:
+
+```bash
+python3 -m venv ~/.agents/skills/slack/.venv
+~/.agents/skills/slack/.venv/bin/pip install -r ~/.agents/skills/slack/requirements.txt
+```
+
 The `scripts/slack_client.py` script provides these commands. All commands support an optional `-w <workspace>` flag to specify the workspace.
 
 ### Core Commands
@@ -262,6 +283,8 @@ The `scripts/slack_client.py` script provides these commands. All commands suppo
 | `fetch-users` | - | Force refresh user cache from Slack API |
 | `history` | channel_id [limit] | Get message history |
 | `replies` | channel_id thread_ts | Get thread replies |
+| `thread-view` | [limit] [--current-ts ts] | Read the Threads view: subscribed threads newest-reply first, each with the caller's `last_read` cursor and the newest few replies; read-only. Page older threads with `--current-ts` set to the previous page's oldest `latest_reply` |
+| `mark-read` | channel_id message_ts --confirm | Move the authenticated user's channel read cursor forward through a timestamp; mutating, confirmation-gated and fail-closed if the current cursor is unavailable |
 | `search` | query [count] | Search messages |
 | `send` | channel_id text [thread_ts] | Send a message |
 | `permalink` | channel_id message_ts [workspace] | Get message permalink |
@@ -277,34 +300,34 @@ The `scripts/slack_client.py` script provides these commands. All commands suppo
 ### Example Usage
 
 ```bash
-SCRIPT=~/.agents/skills/slack/scripts/slack_client.py
+SLACK=~/.agents/skills/slack/scripts/slack
 
 # List configured workspaces
-python3 $SCRIPT workspaces
+$SLACK workspaces
 
 # Switch active workspace
-python3 $SCRIPT switch acme-corp
+$SLACK switch acme-corp
 
 # Use specific workspace for one command
-python3 $SCRIPT -w hartreeworks channels
+$SLACK -w hartreeworks channels
 
 # List public channels
-python3 $SCRIPT channels "public_channel"
+$SLACK channels "public_channel"
 
 # Search for messages
-python3 $SCRIPT search "from:@username after:2025-01-01" 50
+$SLACK search "from:@username after:2025-01-01" 50
 
 # Send a message
-python3 $SCRIPT send "C0123456789" "Hello world!"
+$SLACK send "C0123456789" "Hello world!"
 
 # Send a thread reply
-python3 $SCRIPT send "C0123456789" "Thread reply" "1234567890.123456"
+$SLACK send "C0123456789" "Thread reply" "1234567890.123456"
 
 # Get channel history
-python3 $SCRIPT history "C0123456789" 20
+$SLACK history "C0123456789" 20
 
 # Get message permalink
-python3 $SCRIPT permalink "C0123456789" "1234567890.123456"
+$SLACK permalink "C0123456789" "1234567890.123456"
 ```
 
 ## Workspace Selection
@@ -385,12 +408,12 @@ On lookup errors (user not found, channel not found), the cached entry may be st
 
 1. Find the channel ID (check cache or list channels):
    ```bash
-   python3 $SCRIPT channels "public_channel,private_channel"
+   $SLACK channels "public_channel,private_channel"
    ```
 
 2. Send the message:
    ```bash
-   python3 $SCRIPT send "C0123456789" "Your message here"
+   $SLACK send "C0123456789" "Your message here"
    ```
 
 ### To a Thread
@@ -398,19 +421,19 @@ On lookup errors (user not found, channel not found), the cached entry may be st
 1. Get the thread's parent message timestamp (`ts`)
 2. Send the reply:
    ```bash
-   python3 $SCRIPT send "C0123456789" "Thread reply" "1234567890.123456"
+   $SLACK send "C0123456789" "Thread reply" "1234567890.123456"
    ```
 
 ### To a DM
 
 1. Find the DM channel ID (check cache or use @username):
    ```bash
-   python3 $SCRIPT channels "im"
+   $SLACK channels "im"
    ```
 
 2. Send the message:
    ```bash
-   python3 $SCRIPT send "D0123456789" "Your DM message"
+   $SLACK send "D0123456789" "Your DM message"
    ```
 
 ### Message Formatting
@@ -449,7 +472,7 @@ To check what the user missed or review recent activity:
 
 1. Get recent messages from relevant channels:
    ```bash
-   python3 $SCRIPT history "C0123456789" 50
+   $SLACK history "C0123456789" 50
    ```
 
 2. For each channel of interest, summarize:
@@ -459,7 +482,7 @@ To check what the user missed or review recent activity:
 
 3. Search for messages mentioning the user:
    ```bash
-   python3 $SCRIPT search "<@USER_ID>" 20
+   $SLACK search "<@USER_ID>" 20
    ```
 
 ## Workflow 3: Slack Activity Digest
@@ -483,7 +506,7 @@ Present these options using AskUserQuestion:
 
 1. Search for user's sent messages in the selected period:
    ```bash
-   python3 $SCRIPT search "from:@username after:2025-01-01" 100
+   $SLACK search "from:@username after:2025-01-01" 100
    ```
 
 2. Analyze messages and group by theme/conversation:
@@ -538,8 +561,8 @@ After generating the digest, write `~/.agents/skills/slack/last-digest.json`:
   "period": "2025-01-13 to 2025-01-15",
   "workspace": "hartreeworks",
   "messages": {
-    "1.1": {"channel": "C04AFNMCNFP", "ts": "1736789012.123456"},
-    "1.2": {"channel": "C04AFNMCNFP", "ts": "1736789100.654321"},
+    "1.1": {"channel": "C0123456789", "ts": "1736789012.123456"},
+    "1.2": {"channel": "C0123456789", "ts": "1736789100.654321"},
     "2.1": {"channel": "D18U650RY", "ts": "1736801234.111111"},
     "3.1": {"channel": "C02ABC123", "ts": "1736812345.222222"}
   }
@@ -555,12 +578,12 @@ When user says "open 1.2" or "open message 2.1":
 3. Generate permalink using the `permalink` command with the user's link_style:
    ```bash
    # For link_style: "app" (default)
-   python3 $SCRIPT permalink "C04AFNMCNFP" "1736789100.654321" "hartreeworks" "app"
-   # Returns: https://hartreeworks.slack.com/archives/C04AFNMCNFP/p1736789100654321
+   $SLACK permalink "C0123456789" "1736789100.654321" "hartreeworks" "app"
+   # Returns: https://hartreeworks.slack.com/archives/C0123456789/p1736789100654321
 
    # For link_style: "browser"
-   python3 $SCRIPT permalink "C04AFNMCNFP" "1736789100.654321" "hartreeworks" "browser"
-   # Returns: https://hartreeworks.slack.com/messages/C04AFNMCNFP/p1736789100654321
+   $SLACK permalink "C0123456789" "1736789100.654321" "hartreeworks" "browser"
+   # Returns: https://hartreeworks.slack.com/messages/C0123456789/p1736789100654321
    ```
 5. Open the link:
    ```bash
@@ -591,12 +614,12 @@ To retrieve messages the user sent during a specific period:
 
 1. Search for the user's messages:
    ```bash
-   python3 $SCRIPT search "from:@username" 50
+   $SLACK search "from:@username" 50
    ```
 
 2. Filter by date range if specified:
    ```bash
-   python3 $SCRIPT search "from:@username after:2025-01-01 before:2025-01-31" 100
+   $SLACK search "from:@username after:2025-01-01 before:2025-01-31" 100
    ```
 
 3. Present results grouped by channel or date.
@@ -619,13 +642,13 @@ Export the user's sent messages with full thread context to a JSON file. Support
 ### Basic export
 
 ```bash
-SCRIPT=~/.agents/skills/slack/scripts/slack_client.py
+SLACK=~/.agents/skills/slack/scripts/slack
 
 # Export last 6 months of messages
-python3 $SCRIPT export --from 2025-07-01 --to 2026-01-05 --output ~/slack-export.json
+$SLACK export --from 2025-07-01 --to 2026-01-05 --output ~/slack-export.json
 
 # Export for a specific workspace
-python3 $SCRIPT -w 80000hours export --from 2025-07-01 --to 2026-01-05 --output ~/slack-export.json
+$SLACK -w hartreeworks export --from 2025-07-01 --to 2026-01-05 --output ~/slack-export.json
 ```
 
 ### Resume an interrupted export
@@ -633,13 +656,13 @@ python3 $SCRIPT -w 80000hours export --from 2025-07-01 --to 2026-01-05 --output 
 If the export is interrupted (Ctrl+C or error), resume from where it left off:
 
 ```bash
-python3 $SCRIPT export --resume
+$SLACK export --resume
 ```
 
 ### Check export status
 
 ```bash
-python3 $SCRIPT export-status
+$SLACK export-status
 ```
 
 ### How it works
@@ -664,8 +687,8 @@ The JSON export contains:
 ```json
 {
   "metadata": {
-    "workspace": "80000hours",
-    "user": {"id": "U...", "username": "pete.hartree"},
+    "workspace": "hartreeworks",
+    "user": {"id": "U...", "username": "your.username"},
     "date_range": {"from": "2025-07-01", "to": "2026-01-05"},
     "exported_at": "2026-01-05T12:00:00Z",
     "stats": {
@@ -708,13 +731,13 @@ For 6 months of active usage:
 ### Fetch Thread Replies
 
 ```bash
-python3 $SCRIPT replies "C0123456789" "1234567890.123456"
+$SLACK replies "C0123456789" "1234567890.123456"
 ```
 
 ### Reply to a Thread
 
 ```bash
-python3 $SCRIPT send "C0123456789" "Your reply" "1234567890.123456"
+$SLACK send "C0123456789" "Your reply" "1234567890.123456"
 ```
 
 ## Channel Discovery
@@ -722,19 +745,19 @@ python3 $SCRIPT send "C0123456789" "Your reply" "1234567890.123456"
 ### List All Channels
 
 ```bash
-python3 $SCRIPT channels "public_channel,private_channel"
+$SLACK channels "public_channel,private_channel"
 ```
 
 ### List DM Conversations
 
 ```bash
-python3 $SCRIPT channels "im,mpim"
+$SLACK channels "im,mpim"
 ```
 
 ### List All Users
 
 ```bash
-python3 $SCRIPT users
+$SLACK users
 ```
 
 ## Error Handling
@@ -753,7 +776,7 @@ python3 $SCRIPT users
 Browser tokens (xoxc/xoxd) expire periodically. If requests fail with auth errors:
 1. Extract fresh tokens from browser
 2. Update `config.json`
-3. Test with `python3 $SCRIPT auth`
+3. Test with `$SLACK auth`
 
 ## Known Limitations
 
@@ -768,15 +791,3 @@ Workarounds:
 - Search for messages mentioning the user's ID: `<@USER_ID>`
 - Search for recent activity in user's DMs
 - Check specific channels for recent messages
-
-## Additional Resources
-
-### Reference Files
-
-For detailed API response formats:
-- **`references/tools-reference.md`** - Complete API documentation
-
-### Token Setup
-
-For extracting browser tokens:
-- **`references/setup-guide.md`** - Step-by-step token extraction guide

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SKILL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CLIENT="$SKILL_ROOT/scripts/slack_client.py"
+VENV_PY="$SKILL_ROOT/.venv/bin/python"
+
+is_usable_python() {
+  local candidate="$1"
+
+  if [[ ! -x "$candidate" ]]; then
+    return 1
+  fi
+
+  "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1 || return 1
+  "$candidate" -c 'import requests' >/dev/null 2>&1 || return 1
+}
+
+if is_usable_python "$VENV_PY"; then
+  exec "$VENV_PY" "$CLIENT" "$@"
+fi
+
+if command -v python3 >/dev/null 2>&1 && is_usable_python "$(command -v python3)"; then
+  exec "$(command -v python3)" "$CLIENT" "$@"
+fi
+
+cat >&2 <<EOF
+No usable Python runtime found for the Slack skill.
+
+Repair the local virtualenv with:
+  python3 -m venv "$SKILL_ROOT/.venv"
+  "$SKILL_ROOT/.venv/bin/pip" install -r "$SKILL_ROOT/requirements.txt"
+EOF
+exit 1

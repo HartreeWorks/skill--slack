@@ -1,6 +1,14 @@
-# Copy from example files to get started:
-#   cp config.example.json config.json
-__pycache__/
-
-# Private local data (not published)
+# Local authentication and runtime state
+config.json
 data/
+session-state.json
+session-state.sync-conflict-*.json
+.publish-state.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
