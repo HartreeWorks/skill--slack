@@ -1,13 +1,13 @@
 # Slack
 
-A skill for searching, reading and sending Slack messages from your agent across multiple workspaces. It resolves Slack user IDs before presenting messages, handles shared Slack Connect channels, and supports thread activity, digests and message exports.
+A skill for searching, reading and sending Slack messages from your agent across multiple workspaces. Paste a Slack link and your agent reads the whole thread around it, with names and times filled in. It also handles shared Slack Connect channels, digests and message exports.
 
 ## Requirements
 
 - Python 3.10 or later with the `requests` package
 - Access to Slack in a browser so you can copy your browser session tokens into a local `config.json`
 
-The tokens remain in the local skill folder and are excluded from publication. Follow the [setup guide in SKILL.md](./SKILL.md#setup) to configure a workspace and test the connection.
+The tokens remain in the local skill folder and are excluded from publication. Follow the [setup guide](./references/setup.md) to configure a workspace and test the connection.
 
 ## Installation
 

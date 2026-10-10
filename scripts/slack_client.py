@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Slack client using browser tokens (xoxc/xoxd) for stealth mode.
-Supports multiple workspaces with contextual auto-selection.
+Supports multiple workspaces; each call names its workspace with -w, or takes it
+from a Slack link or a previously seen channel ID.
 """
 
 import requests
@@ -14,6 +15,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 # Cache staleness threshold
 USER_CACHE_STALE_DAYS = 14
@@ -199,14 +201,18 @@ class SlackClient:
         return result
 
     def conversations_history(self, channel: str, limit: int = 100, oldest: str = None,
-                              latest: str = None, cursor: str = None) -> dict:
-        """Get message history from a channel or DM, optionally bounded and paginated."""
+                              latest: str = None, cursor: str = None,
+                              inclusive: bool = True) -> dict:
+        """Get message history from a channel or DM, optionally bounded and paginated.
+
+        With only `oldest` set, Slack returns the messages immediately after it.
+        """
         data = {"channel": channel, "limit": str(limit)}
         if oldest:
             data["oldest"] = oldest
         if latest:
             data["latest"] = latest
-            data["inclusive"] = "true"
+            data["inclusive"] = "true" if inclusive else "false"
         if cursor:
             data["cursor"] = cursor
         return self._post("conversations.history", data)
@@ -250,11 +256,31 @@ class SlackClient:
         return self._post("conversations.info", {"channel": channel})
 
     def conversations_replies(self, channel: str, thread_ts: str) -> dict:
-        """Get replies in a thread."""
-        return self._post("conversations.replies", {
-            "channel": channel,
-            "ts": thread_ts
-        })
+        """Get every message in a thread, parent first, following pagination.
+
+        Given a reply's ts instead of the parent's, Slack returns only that reply.
+        """
+        messages = []
+        seen = set()
+        cursor = None
+        result = {}
+        for _ in range(25):
+            data = {"channel": channel, "ts": thread_ts, "limit": "200"}
+            if cursor:
+                data["cursor"] = cursor
+            result = self._post("conversations.replies", data)
+            if not result.get("ok"):
+                return result
+            for message in result.get("messages", []):
+                if message.get("ts") not in seen:
+                    seen.add(message.get("ts"))
+                    messages.append(message)
+            cursor = (result.get("response_metadata") or {}).get("next_cursor") or None
+            if not cursor:
+                break
+        result["messages"] = messages
+        result["has_more"] = False
+        return result
 
     def thread_view(self, limit: int = 20, current_ts: str = None) -> dict:
         """Read the Threads view (subscribed threads, newest reply first).
@@ -318,6 +344,10 @@ class SlackClient:
         if thread_ts:
             data["thread_ts"] = thread_ts
         return self._post("chat.postMessage", data)
+
+    def users_info(self, user_id: str) -> dict:
+        """Get one user's profile, including Slack Connect and deactivated users."""
+        return self._post("users.info", {"user": user_id})
 
     def users_list(self, limit: int = 200) -> dict:
         """List all users in the workspace."""
@@ -387,22 +417,6 @@ def set_active_workspace(workspace: str):
     state["active_workspace"] = workspace
     state["last_action_timestamp"] = datetime.now().isoformat()
     save_session_state(state)
-
-
-def get_active_workspace() -> str | None:
-    """Get the active workspace if recent (within 10 minutes)."""
-    state = load_session_state()
-    active = state.get("active_workspace")
-    last_action = state.get("last_action_timestamp")
-
-    if active and last_action:
-        try:
-            last = datetime.fromisoformat(last_action)
-            if datetime.now() - last < timedelta(minutes=10):
-                return active
-        except (ValueError, TypeError):
-            pass
-    return None
 
 
 def record_channel_workspace(channel_id: str, workspace: str):
@@ -1263,8 +1277,8 @@ def load_config(workspace: str = None) -> tuple[dict, str]:
     """
     Load credentials for a workspace.
 
-    Args:
-        workspace: Explicit workspace name. If None, uses selection priority.
+    There is no implicit default: guessing silently picks the wrong workspace and
+    surfaces later as channel_not_found. With one workspace configured, it is used.
 
     Returns:
         tuple: (credentials_dict, workspace_name)
@@ -1275,25 +1289,22 @@ def load_config(workspace: str = None) -> tuple[dict, str]:
     if not workspaces:
         raise ValueError("No workspaces configured in config.json")
 
-    # 1. Explicit workspace requested
-    if workspace:
-        if workspace not in workspaces:
-            raise ValueError(f"Unknown workspace: {workspace}. Available: {list(workspaces.keys())}")
-        return workspaces[workspace], workspace
+    if not workspace:
+        if len(workspaces) == 1:
+            workspace = next(iter(workspaces))
+        else:
+            raise ValueError(
+                f"No workspace given. Pass -w <workspace>, one of: {', '.join(workspaces)}. "
+                "For a Slack link, use read-link, which takes the workspace from the URL."
+            )
 
-    # 2. Try active workspace from session state (if recent)
-    active = get_active_workspace()
-    if active and active in workspaces:
-        return workspaces[active], active
+    if workspace not in workspaces:
+        raise ValueError(f"Unknown workspace: {workspace}. Available: {', '.join(workspaces)}")
+    return workspaces[workspace], workspace
 
-    # 3. Fall back to default
-    default = config.get("default_workspace")
-    if default and default in workspaces:
-        return workspaces[default], default
 
-    # 4. Last resort: first workspace
-    first_ws = next(iter(workspaces))
-    return workspaces[first_ws], first_ws
+def make_client(creds: dict) -> 'SlackClient':
+    return SlackClient(creds["xoxc_token"], creds["xoxd_token"], creds.get("user_agent"))
 
 
 def get_link_style() -> str:
@@ -1302,20 +1313,384 @@ def get_link_style() -> str:
     return config.get("link_style", "app")
 
 
+# ==================== Readable Output ====================
+
+def format_ts(ts: str) -> str:
+    """Render a Slack timestamp as local time, e.g. 2026-10-10 13:17 CEST."""
+    try:
+        return datetime.fromtimestamp(float(ts)).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    except (TypeError, ValueError):
+        return ""
+
+
+def blocks_text(blocks) -> str:
+    """Fallback text for messages (often bot alerts) whose `text` is empty."""
+    parts = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if isinstance(node.get("text"), str):
+                parts.append(node["text"])
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(blocks or [])
+    return " ".join(part.strip() for part in parts if part.strip())
+
+
+class NameResolver:
+    """Resolve user and channel IDs to names via the workspace cache.
+
+    Misses are looked up once (users.info / conversations.info) and written back
+    to data/slack-cache-<workspace>.json, so each name costs one API call ever.
+    """
+
+    MAX_LOOKUPS = 40
+
+    def __init__(self, client: 'SlackClient', workspace: str):
+        self.client = client
+        self.workspace = workspace
+        if is_user_cache_empty(workspace):
+            print(f"User cache empty. Fetching users from {workspace}...", file=sys.stderr)
+            fetch_and_cache_users(client, workspace)
+        elif is_user_cache_stale(workspace):
+            trigger_background_user_refresh(workspace)
+        cache = load_cache(workspace)
+        self.users = cache.get("users", {})
+        self.channels = cache.get("channel_names", {})
+        self.new_users = {}
+        self.new_channels = {}
+        self.lookups = 0
+
+    def _lookup_allowed(self) -> bool:
+        self.lookups += 1
+        return self.lookups <= self.MAX_LOOKUPS
+
+    def _remember_user(self, user_id: str, data: dict):
+        self.users[user_id] = data
+        self.new_users[user_id] = data
+
+    def user_name(self, user_id: str, profile: dict = None) -> str:
+        if not user_id:
+            return "unknown"
+        entry = self.users.get(user_id)
+        if not entry and profile:
+            # Slack Connect messages embed the author's profile.
+            entry = {
+                "username": profile.get("name", ""),
+                "display_name": profile.get("display_name") or profile.get("real_name", ""),
+                "real_name": profile.get("real_name", ""),
+                "first_name": profile.get("first_name", ""),
+            }
+            self._remember_user(user_id, entry)
+        if not entry and self._lookup_allowed():
+            result = self.client.users_info(user_id)
+            if result.get("ok"):
+                user = result.get("user", {})
+                p = user.get("profile", {})
+                entry = {
+                    "username": user.get("name", ""),
+                    "display_name": p.get("display_name") or p.get("real_name") or user.get("name", ""),
+                    "real_name": p.get("real_name", ""),
+                    "first_name": p.get("first_name", ""),
+                }
+                self._remember_user(user_id, entry)
+        if not entry:
+            return user_id
+        return entry.get("real_name") or entry.get("display_name") or entry.get("username") or user_id
+
+    def describe_channel(self, channel: dict, lookup_users: bool = True) -> str | None:
+        if channel.get("is_im"):
+            other = channel.get("user")
+            if not lookup_users and other not in self.users:
+                return None
+            return f"DM with {self.user_name(other)}"
+        name = channel.get("name") or ""
+        if channel.get("is_mpim"):
+            members = re.sub(r"^mpdm-|-\d+$", "", name).split("--")
+            return f"group DM ({', '.join(m for m in members if m)})"
+        return f"#{name}" if name else None
+
+    def remember_channels(self, channels: list):
+        """Cache names from a conversations.list result without extra API calls."""
+        for channel in channels:
+            name = self.describe_channel(channel, lookup_users=False)
+            if channel.get("id") and name:
+                self.channels[channel["id"]] = name
+                self.new_channels[channel["id"]] = name
+
+    def channel_name(self, channel_id: str) -> str:
+        if channel_id in self.channels:
+            return self.channels[channel_id]
+        if self._lookup_allowed():
+            result = self.client.conversations_info(channel_id)
+            if result.get("ok"):
+                name = self.describe_channel(result.get("channel", {}))
+                if name:
+                    self.channels[channel_id] = name
+                    self.new_channels[channel_id] = name
+                    return name
+        return channel_id
+
+    def clean_text(self, text: str) -> str:
+        """Turn Slack markup (<@U..>, <#C..|name>, <url|label>) into plain text."""
+        def replace(match):
+            target, _, label = match.group(1).partition("|")
+            if target.startswith("@"):
+                return "@" + (label or self.user_name(target[1:]))
+            if target.startswith("#"):
+                return "#" + (label or self.channel_name(target[1:]).lstrip("#"))
+            if target.startswith("!"):
+                return label or "@" + target[1:].split("^")[0]
+            if label and label != target:
+                return f"{label} ({target})"
+            return target.removeprefix("mailto:")
+
+        text = re.sub(r"<([^<>\n]+)>", replace, text or "")
+        return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+    def message(self, msg: dict, linked_ts: str = None) -> dict:
+        ts = msg.get("ts", "")
+        user_id = msg.get("user")
+        if user_id:
+            author = self.user_name(user_id, msg.get("user_profile"))
+        else:
+            author = (msg.get("bot_profile") or {}).get("name") or msg.get("username") or "unknown"
+        out = {
+            "ts": ts,
+            "time": format_ts(ts),
+            "user": user_id or msg.get("bot_id"),
+            "user_name": author,
+            "text": self.clean_text(msg.get("text") or blocks_text(msg.get("blocks"))),
+        }
+        if msg.get("thread_ts") and msg["thread_ts"] != ts:
+            out["thread_ts"] = msg["thread_ts"]
+        if msg.get("reply_count"):
+            out["reply_count"] = msg["reply_count"]
+        if msg.get("subtype"):
+            out["subtype"] = msg["subtype"]
+        attachments = []
+        for attachment in msg.get("attachments") or []:
+            pieces = [attachment.get(k) for k in ("pretext", "title", "text")]
+            summary = " | ".join(p for p in pieces if p) or attachment.get("fallback")
+            if summary:
+                attachments.append(self.clean_text(summary))
+        if attachments:
+            out["attachments"] = attachments
+        files = [
+            {"name": f.get("name") or f.get("title"), "url": f.get("url_private")}
+            for f in msg.get("files") or []
+        ]
+        if files:
+            out["files"] = files
+        if msg.get("reactions"):
+            out["reactions"] = {r["name"]: r.get("count", 0) for r in msg["reactions"]}
+        if msg.get("edited"):
+            out["edited"] = True
+        if "replies" in msg:
+            out["replies"] = [self.message(reply, linked_ts) for reply in msg["replies"]]
+        if linked_ts and ts == linked_ts:
+            out["linked"] = True
+        return out
+
+    def save(self):
+        """Merge newly learned names into the cache (a background refresh may have written it)."""
+        if not self.new_users and not self.new_channels:
+            return
+        cache = load_cache(self.workspace)
+        cache.setdefault("users", {}).update(self.new_users)
+        cache.setdefault("channel_names", {}).update(self.new_channels)
+        save_cache(self.workspace, cache)
+
+
+def channel_hint(result: dict, workspace: str) -> dict:
+    """Explain the usual cause of channel_not_found: the wrong workspace."""
+    if result.get("error") in ("channel_not_found", "thread_not_found", "not_in_channel"):
+        configured = list(load_full_config().get("workspaces", {}))
+        result["hint"] = (
+            f"Checked workspace {workspace}. This usually means the channel belongs to another "
+            f"workspace; configured: {', '.join(configured)}. For a Slack link, use read-link."
+        )
+    return result
+
+
+# ==================== Slack Links ====================
+
+def parse_slack_link(url: str) -> dict:
+    """Parse a message link into domain/team, channel, message ts and thread ts.
+
+    Handles https://<domain>.slack.com/archives/<C>/p<ts>[?thread_ts=<ts>] (and
+    /messages/), plus https://app.slack.com/client/<T>/<C>/thread/<C>-<ts>.
+    """
+    parsed = urlparse(url.strip().strip("<>"))
+    host = (parsed.hostname or "").lower()
+    parts = [part for part in parsed.path.split("/") if part]
+    link = {"domain": None, "team_id": None, "channel": None, "ts": None, "thread_ts": None}
+
+    if host == "app.slack.com" and len(parts) >= 3 and parts[0] == "client":
+        link["team_id"], link["channel"] = parts[1], parts[2]
+        if len(parts) >= 5 and parts[3] == "thread":
+            match = re.fullmatch(r"[A-Z0-9]+-(\d{10}\.\d{6})", parts[4])
+            if match:
+                link["ts"] = match.group(1)
+    elif host.endswith(".slack.com") and len(parts) >= 3 and parts[0] in ("archives", "messages"):
+        link["domain"] = host[: -len(".slack.com")]
+        link["channel"] = parts[1]
+        match = re.fullmatch(r"p(\d{10})(\d{6})", parts[2])
+        if match:
+            link["ts"] = f"{match.group(1)}.{match.group(2)}"
+
+    thread_ts = (parse_qs(parsed.query).get("thread_ts") or [None])[0]
+    if thread_ts and re.fullmatch(r"\d{10}\.\d{6}", thread_ts):
+        link["thread_ts"] = thread_ts
+
+    if not link["channel"] or not link["ts"]:
+        raise ValueError(
+            "Not a Slack message link. Expected "
+            "https://<workspace>.slack.com/archives/<channel>/p<timestamp>"
+        )
+    return link
+
+
+def workspace_team(workspace: str) -> dict:
+    """Return {"domain", "id"} for a workspace, caching auth.test's answer."""
+    cache = load_cache(workspace)
+    team = cache.get("team") or {}
+    if team.get("domain") and team.get("id"):
+        return team
+    creds, _ = load_config(workspace)
+    auth = make_client(creds).auth_test()
+    if not auth.get("ok"):
+        return {}
+    domain = urlparse(auth.get("url", "")).hostname or ""
+    team = {"domain": domain.removesuffix(".slack.com"), "id": auth.get("team_id")}
+    cache["team"] = team
+    save_cache(workspace, cache)
+    return team
+
+
+def workspace_for_link(link: dict) -> str:
+    """Match a link to a configured workspace by its domain or team ID."""
+    workspaces = list(load_full_config().get("workspaces", {}))
+    for workspace in workspaces:
+        team = workspace_team(workspace)
+        if (link["domain"] and team.get("domain") == link["domain"]) or \
+                (link["team_id"] and team.get("id") == link["team_id"]):
+            return workspace
+    inferred = infer_workspace_from_channel(link["channel"])
+    if inferred:
+        return inferred
+    raise ValueError(
+        f"No configured workspace matches {link['domain'] or link['team_id']}. "
+        f"Configured: {', '.join(workspaces)}. Pass -w if the channel is shared into one of them."
+    )
+
+
+def read_link(url: str, workspace: str = None, context: int = None) -> dict:
+    """Read a pasted Slack link in full: the whole thread, plus channel context."""
+    link = parse_slack_link(url)
+    workspace = workspace or workspace_for_link(link)
+    creds, workspace = load_config(workspace)
+    client = make_client(creds)
+    channel, linked_ts = link["channel"], link["ts"]
+
+    root_ts = link["thread_ts"] or linked_ts
+    thread = client.conversations_replies(channel, root_ts)
+    if not thread.get("ok"):
+        return channel_hint({**thread, "_workspace": workspace}, workspace)
+    messages = thread.get("messages", [])
+    # A link to a reply without ?thread_ts= returns only the reply; refetch the whole thread.
+    parent_ts = (messages[0] if messages else {}).get("thread_ts")
+    if parent_ts and parent_ts != root_ts:
+        root_ts = parent_ts
+        thread = client.conversations_replies(channel, root_ts)
+        if not thread.get("ok"):
+            return channel_hint({**thread, "_workspace": workspace}, workspace)
+        messages = thread.get("messages", [])
+
+    names = NameResolver(client, workspace)
+    if context is None:
+        # A lone message often continues a conversation in the channel itself.
+        context = 0 if len(messages) > 1 else 5
+    result = {
+        "ok": True,
+        "workspace": workspace,
+        "channel": {"id": channel, "name": names.channel_name(channel)},
+        "linked_ts": linked_ts,
+        "linked_is_reply": root_ts != linked_ts,
+        "thread_ts": root_ts,
+        "reply_count": max(len(messages) - 1, 0),
+        "thread": [names.message(m, linked_ts) for m in messages],
+    }
+    if context > 0:
+        before = client.conversations_history(channel, context, latest=root_ts, inclusive=False)
+        after = client.conversations_history(channel, context, oldest=root_ts)
+        result["context_before"] = [names.message(m) for m in reversed(before.get("messages", []))]
+        result["context_after"] = [names.message(m) for m in reversed(after.get("messages", []))]
+    names.save()
+    record_channel_workspace(channel, workspace)
+    return result
+
+
+HELP = """Usage: slack -w <workspace> <command> [args]
+
+Every command needs -w <workspace> (list them with `slack workspaces`), except:
+read-link (takes the workspace from the URL), digest (all workspaces unless -w),
+workspaces, add-workspace, and commands on a channel ID this client has seen before.
+
+Reading
+  read-link <url> [--context N]     Read a pasted Slack link: the whole thread with names
+                                    and times, the linked message flagged. A message with
+                                    no thread also gets 5 channel messages either side.
+  history <channel> [limit] [--oldest ts] [--latest ts] [--cursor c] [--with-replies]
+  replies <channel> <thread_ts>     Whole thread. thread_ts must be the parent's ts: a
+                                    reply's ts returns only that reply.
+  search <query> [count]            Slack search syntax: from:@name in:#channel after:YYYY-MM-DD
+  search-page <query> <page> [count]
+  thread-view [limit] [--current-ts ts]
+  info <channel> | counts | download <url> <output_path> [max_bytes]
+
+  --resolve (history, replies, search): slim messages with names, local times and
+  readable mentions instead of raw API JSON.
+
+Names
+  user-lookup | fetch-users | users | channels [types]
+
+Writing
+  send <channel> <text> [thread_ts]
+  mark-read <channel> <message_ts> --confirm
+
+Other
+  auth | permalink <channel> <ts> [workspace] [link_style] | workspaces
+  add-workspace <name> <xoxc> <xoxd> [user_agent]
+  export --from DATE --to DATE --output FILE | export --resume | export-status
+  digest [--output FILE] | digest-config
+"""
+
+
 # ==================== CLI ====================
 
-def parse_global_args() -> tuple[str | None, list[str]]:
+def parse_global_args() -> tuple[str | None, list[str], bool]:
     """
-    Parse global flags like --workspace/-w.
+    Parse global flags: --workspace/-w and --resolve.
 
     Returns:
-        tuple: (workspace_name or None, remaining args)
+        tuple: (workspace_name or None, remaining args, resolve)
     """
     workspace = None
+    resolve = False
     args_filtered = []
     i = 1  # Skip script name
 
     while i < len(sys.argv):
+        if sys.argv[i] == "--resolve":
+            resolve = True
+            i += 1
+            continue
         if sys.argv[i] in ("--workspace", "-w"):
             if i + 1 < len(sys.argv):
                 workspace = sys.argv[i + 1]
@@ -1327,47 +1702,27 @@ def parse_global_args() -> tuple[str | None, list[str]]:
         args_filtered.append(sys.argv[i])
         i += 1
 
-    return workspace, args_filtered
+    return workspace, args_filtered, resolve
+
+
+# Commands whose first argument is a channel ID, so the workspace can be inferred.
+CHANNEL_COMMANDS = {"history", "info", "replies", "mark-read", "send", "permalink"}
 
 
 def main():
     """CLI interface for the Slack client."""
-    workspace_arg, args = parse_global_args()
+    workspace_arg, args, resolve = parse_global_args()
 
-    if len(args) < 1:
-        print(json.dumps({
-            "error": "No command provided",
-            "usage": "slack_client.py [-w workspace] <command> [args]",
-            "commands": {
-                "auth": "Test authentication",
-                "channels": "List channels (optional: types)",
-                "users": "List users",
-                "history": "Get channel history (channel_id, optional: limit, --oldest ts, --latest ts, --cursor c)",
-                "counts": "Get read cursors, latest timestamps and unread flags for all conversations",
-                "download": "Download an authenticated Slack image (url, output_path, optional: max_bytes)",
-                "info": "Get conversation metadata including the caller's read cursor (channel_id)",
-                "replies": "Get thread replies (channel_id, thread_ts)",
-                "thread-view": "Read the Threads view: subscribed threads with read cursors (optional: limit, --current-ts ts)",
-                "mark-read": "Mark a channel read through a message timestamp (channel_id, message_ts, --confirm)",
-                "search": "Search messages (query, optional: count)",
-                "search-page": "Search messages with pagination, oldest first (query, page, optional: count)",
-                "send": "Send message (channel_id, text, optional: thread_ts)",
-                "permalink": "Get message permalink (channel_id, message_ts, optional: workspace, link_style)",
-                "workspaces": "List configured workspaces",
-                "switch": "Switch active workspace (workspace_name)",
-                "add-workspace": "Add a new workspace (name, xoxc, xoxd, optional: user_agent)",
-                "export": "Export messages (--from DATE --to DATE --output FILE [--resume])",
-                "export-status": "Check export status",
-                "fetch-users": "Fetch and cache all workspace users",
-                "user-lookup": "Get user ID to name lookup from cache",
-                "digest": "Generate overnight digest (mentions, replies, channel activity)",
-                "digest-config": "Show current digest configuration"
-            }
-        }, indent=2))
-        sys.exit(1)
+    if not args or args[0] in ("help", "--help", "-h") or "--help" in args or "-h" in args:
+        print(HELP)
+        sys.exit(0 if args else 1)
 
     command = args[0]
     cmd_args = args[1:]
+
+    if (not workspace_arg and command in CHANNEL_COMMANDS and cmd_args
+            and re.fullmatch(r"[CDG][A-Z0-9]+", cmd_args[0])):
+        workspace_arg = infer_workspace_from_channel(cmd_args[0])
 
     # Commands that don't need a client
     if command == "workspaces":
@@ -1375,26 +1730,40 @@ def main():
         state = load_session_state()
         result = {
             "workspaces": list(config.get("workspaces", {}).keys()),
-            "default": config.get("default_workspace"),
-            "active": state.get("active_workspace"),
-            "link_style": config.get("link_style", "app")
+            "last_used": state.get("active_workspace"),
+            "link_style": config.get("link_style", "app"),
+            "note": "Pass -w <workspace> on every command; there is no default.",
         }
         print(json.dumps(result, indent=2))
         return
 
     if command == "switch":
+        print(json.dumps({
+            "error": "switch has been removed: pass -w <workspace> on each command instead",
+            "workspaces": list(load_full_config().get("workspaces", {})),
+        }))
+        sys.exit(1)
+
+    if command == "read-link":
         if not cmd_args:
-            print(json.dumps({"error": "workspace name required"}))
+            print(json.dumps({"error": "Usage: read-link <slack-url> [--context N]"}))
             sys.exit(1)
-        ws = cmd_args[0]
-        config = load_full_config()
-        if ws not in config.get("workspaces", {}):
-            result = {"error": f"Unknown workspace: {ws}",
-                      "available": list(config.get("workspaces", {}).keys())}
-        else:
-            set_active_workspace(ws)
-            result = {"ok": True, "active_workspace": ws}
-        print(json.dumps(result, indent=2))
+        context = None
+        if "--context" in cmd_args:
+            index = cmd_args.index("--context")
+            try:
+                context = int(cmd_args[index + 1])
+            except (IndexError, ValueError):
+                print(json.dumps({"error": "--context requires a number"}))
+                sys.exit(1)
+        try:
+            result = read_link(cmd_args[0], workspace_arg, context)
+        except Exception as e:
+            print(json.dumps({"error": str(e)}))
+            sys.exit(1)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        if not result.get("ok"):
+            sys.exit(1)
         return
 
     if command == "add-workspace":
@@ -1421,10 +1790,6 @@ def main():
             "user_agent": user_agent
         }
 
-        # Set as default if first workspace
-        if not config.get("default_workspace"):
-            config["default_workspace"] = name
-
         save_config(config)
         result = {"ok": True, "added": name, "workspaces": list(config["workspaces"].keys())}
         print(json.dumps(result, indent=2))
@@ -1437,8 +1802,8 @@ def main():
         # - Fresh cache: return cached data
         try:
             creds, ws_name = load_config(workspace_arg)
-        except Exception:
-            print(json.dumps({"error": "No workspace configured"}))
+        except Exception as e:
+            print(json.dumps({"error": str(e)}))
             sys.exit(1)
 
         cache_empty = is_user_cache_empty(ws_name)
@@ -1547,8 +1912,8 @@ def main():
         # Check status without requiring workspace_arg - look at default/active
         try:
             _, ws_name = load_config(workspace_arg)
-        except Exception:
-            print(json.dumps({"error": "No workspace configured"}))
+        except Exception as e:
+            print(json.dumps({"error": str(e)}))
             sys.exit(1)
 
         state = load_export_state(ws_name)
@@ -1650,7 +2015,7 @@ def main():
             creds.get("user_agent")
         )
     except Exception as e:
-        print(json.dumps({"error": f"Failed to load config: {e}"}))
+        print(json.dumps({"error": str(e)}))
         sys.exit(1)
 
     try:
@@ -1667,6 +2032,9 @@ def main():
             if result.get("ok"):
                 set_active_workspace(ws_name)
                 result["_workspace"] = ws_name
+                names = NameResolver(client, ws_name)
+                names.remember_channels(result.get("channels", []))
+                names.save()
 
         elif command == "users":
             result = client.users_list()
@@ -1685,6 +2053,10 @@ def main():
             remaining = cmd_args[1:]
             while index < len(remaining):
                 arg = remaining[index]
+                if arg == "--with-replies":
+                    options["with_replies"] = True
+                    index += 1
+                    continue
                 if arg in ("--oldest", "--latest", "--cursor"):
                     if index + 1 >= len(remaining):
                         print(json.dumps({"error": f"{arg} requires a value"}))
@@ -1708,6 +2080,28 @@ def main():
                 set_active_workspace(ws_name)
                 record_channel_workspace(channel, ws_name)
                 result["_workspace"] = ws_name
+                if options.get("with_replies"):
+                    for message in result.get("messages", []):
+                        if message.get("reply_count") and message.get("thread_ts") == message.get("ts"):
+                            thread = client.conversations_replies(channel, message["ts"])
+                            if thread.get("ok"):
+                                message["replies"] = [
+                                    reply for reply in thread.get("messages", [])
+                                    if reply.get("ts") != message["ts"]
+                                ]
+                if resolve:
+                    names = NameResolver(client, ws_name)
+                    result = {
+                        "ok": True,
+                        "_workspace": ws_name,
+                        "channel": {"id": channel, "name": names.channel_name(channel)},
+                        "has_more": result.get("has_more", False),
+                        "next_cursor": (result.get("response_metadata") or {}).get("next_cursor") or None,
+                        "messages": [names.message(m) for m in reversed(result.get("messages", []))],
+                    }
+                    names.save()
+            else:
+                channel_hint(result, ws_name)
 
         elif command == "counts":
             result = client.client_counts()
@@ -1746,6 +2140,28 @@ def main():
                 set_active_workspace(ws_name)
                 record_channel_workspace(channel, ws_name)
                 result["_workspace"] = ws_name
+                messages = result.get("messages", [])
+                parent_ts = (messages[0] if messages else {}).get("thread_ts")
+                if parent_ts and parent_ts != cmd_args[1]:
+                    result["warning"] = (
+                        f"{cmd_args[1]} is a reply, so only that reply was returned. "
+                        f"Fetch the whole thread with its parent ts: replies {channel} {parent_ts}"
+                    )
+                if resolve:
+                    names = NameResolver(client, ws_name)
+                    resolved = {
+                        "ok": True,
+                        "_workspace": ws_name,
+                        "channel": {"id": channel, "name": names.channel_name(channel)},
+                        "thread_ts": cmd_args[1],
+                        "messages": [names.message(m) for m in messages],
+                    }
+                    if "warning" in result:
+                        resolved["warning"] = result["warning"]
+                    result = resolved
+                    names.save()
+            else:
+                channel_hint(result, ws_name)
 
         elif command == "thread-view":
             limit = 20
@@ -1810,6 +2226,28 @@ def main():
             if result.get("ok"):
                 set_active_workspace(ws_name)
                 result["_workspace"] = ws_name
+                if resolve:
+                    names = NameResolver(client, ws_name)
+                    matches = []
+                    for match in (result.get("messages") or {}).get("matches", []):
+                        channel = match.get("channel") or {}
+                        if channel.get("is_im") or channel.get("is_mpim"):
+                            channel_name = names.channel_name(channel.get("id"))
+                        else:
+                            channel_name = f"#{channel.get('name')}"
+                        matches.append({
+                            **names.message(match),
+                            "channel": {"id": channel.get("id"), "name": channel_name},
+                            "permalink": match.get("permalink"),
+                        })
+                    result = {
+                        "ok": True,
+                        "_workspace": ws_name,
+                        "query": query,
+                        "total": ((result.get("messages") or {}).get("paging") or {}).get("total"),
+                        "messages": matches,
+                    }
+                    names.save()
 
         elif command == "search-page":
             if len(cmd_args) < 2:
@@ -1848,10 +2286,10 @@ def main():
             result = {"ok": True, "permalink": permalink, "_workspace": ws_name}
 
         else:
-            print(json.dumps({"error": f"Unknown command: {command}"}))
+            print(json.dumps({"error": f"Unknown command: {command}. Run `slack help` for the command list."}))
             sys.exit(1)
 
-        print(json.dumps(result, indent=2))
+        print(json.dumps(result, indent=2, ensure_ascii=resolve is False))
 
     except Exception as e:
         print(json.dumps({"error": str(e)}))
