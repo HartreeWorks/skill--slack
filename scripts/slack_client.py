@@ -405,10 +405,17 @@ def load_session_state() -> dict:
     }
 
 
+def write_json_atomic(path: Path, data: dict):
+    """Write JSON via a temp file and rename, so concurrent runs never leave a half-written file."""
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    tmp.replace(path)
+
+
 def save_session_state(state: dict):
     """Save session state."""
-    with open(SESSION_STATE_PATH, "w") as f:
-        json.dump(state, f, indent=2)
+    write_json_atomic(SESSION_STATE_PATH, state)
 
 
 def set_active_workspace(workspace: str):
@@ -462,9 +469,7 @@ def load_cache(workspace: str) -> dict:
 
 def save_cache(workspace: str, cache: dict):
     """Save cache for a specific workspace."""
-    cache_path = get_cache_path(workspace)
-    with open(cache_path, "w") as f:
-        json.dump(cache, f, indent=2)
+    write_json_atomic(get_cache_path(workspace), cache)
 
 
 def fetch_and_cache_users(client: 'SlackClient', workspace: str) -> dict:
