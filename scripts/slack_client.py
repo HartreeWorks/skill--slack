@@ -7,6 +7,7 @@ from a Slack link or a previously seen channel ID.
 
 import requests
 import json
+import os
 import sys
 import time
 import uuid
@@ -20,10 +21,12 @@ from urllib.parse import parse_qs, urlparse
 # Cache staleness threshold
 USER_CACHE_STALE_DAYS = 14
 
-SKILL_ROOT = Path(__file__).parent.parent
-CONFIG_PATH = SKILL_ROOT / "config.json"
-SESSION_STATE_PATH = SKILL_ROOT / "session-state.json"
-DIGEST_CONFIG_PATH = SKILL_ROOT / "digest-config.json"
+# User data lives outside the skill folder, which skill updates delete and recreate.
+# Same location as scripts/data-dir.sh prints.
+DATA_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "hartreeworks-skills" / "slack"
+CONFIG_PATH = DATA_DIR / "config.json"
+SESSION_STATE_PATH = DATA_DIR / "session-state.json"
+DIGEST_CONFIG_PATH = DATA_DIR / "digest-config.json"
 
 
 def slack_ts_value(timestamp: str) -> int:
@@ -525,6 +528,7 @@ def load_session_state() -> dict:
 
 def write_json_atomic(path: Path, data: dict):
     """Write JSON via a temp file and rename, so concurrent runs never leave a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
@@ -561,7 +565,7 @@ def infer_workspace_from_channel(channel_id: str) -> str | None:
 
 def get_cache_path(workspace: str) -> Path:
     """Get the cache file path for a specific workspace."""
-    return SKILL_ROOT / "data" / f"slack-cache-{workspace}.json"
+    return DATA_DIR / f"slack-cache-{workspace}.json"
 
 
 def load_cache(workspace: str) -> dict:
@@ -731,7 +735,7 @@ def trigger_background_user_refresh(workspace: str):
 
 def get_export_state_path(workspace: str) -> Path:
     """Get the export state file path for a specific workspace."""
-    return SKILL_ROOT / f"export-state-{workspace}.json"
+    return DATA_DIR / f"export-state-{workspace}.json"
 
 
 def load_export_state(workspace: str) -> dict:
@@ -747,6 +751,7 @@ def save_export_state(workspace: str, state: dict):
     """Save export state for resume capability."""
     state_path = get_export_state_path(workspace)
     state["updated_at"] = datetime.now().isoformat()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
     with open(state_path, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -1090,7 +1095,7 @@ def load_digest_config() -> dict:
         return {
             "workspaces": {},
             "lookback_hours": 14,
-            "output_dir": str(SKILL_ROOT / "data" / "digests")
+            "output_dir": str(DATA_DIR / "digests")
         }
     with open(DIGEST_CONFIG_PATH) as f:
         return json.load(f)
@@ -1364,7 +1369,7 @@ def write_digest_output(digest: dict, output_dir: str = None) -> str:
     """
     if not output_dir:
         digest_config = load_digest_config()
-        output_dir = digest_config.get("output_dir", str(SKILL_ROOT / "data" / "digests"))
+        output_dir = digest_config.get("output_dir", str(DATA_DIR / "digests"))
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1385,7 +1390,10 @@ def write_digest_output(digest: dict, output_dir: str = None) -> str:
 def load_full_config() -> dict:
     """Load the full config file."""
     if not CONFIG_PATH.exists():
-        raise FileNotFoundError(f"Config not found: {CONFIG_PATH}")
+        raise FileNotFoundError(
+            f"Config not found: {CONFIG_PATH}. Set up a workspace with references/setup.md "
+            "(installs before update checks kept config.json in the skill folder, which updates delete)."
+        )
     with open(CONFIG_PATH) as f:
         return json.load(f)
 
@@ -1408,6 +1416,7 @@ def open_in_chrome(url: str, workspace: str) -> str | None:
 
 def save_config(config: dict):
     """Save the config file."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
 

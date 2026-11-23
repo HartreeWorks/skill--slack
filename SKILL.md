@@ -12,6 +12,27 @@ SLACK=~/.agents/skills/slack/scripts/slack
 $SLACK help   # every command and flag
 ```
 
+## Before starting: check for updates
+
+If `scripts/check-update.sh` exists in this skill's folder, run
+`bash <this skill's folder>/scripts/check-update.sh` from the user's project
+folder. It checks at most once a day and prints nothing when the skill is
+current.
+
+- **It reports an update:** run it with `--diff` and read the code changes.
+  Show the user the release notes and a short summary of the changes, flagging
+  anything the notes do not explain. Ask whether to update now, update now and
+  automatically from now on, or not now. For the first run it with `--apply`;
+  for the second run it with `--enable-auto`, then `--apply`; for the third
+  carry on.
+- **It reports an automatic update:** run it with `--diff` and read the
+  changes. If they match the release notes and do nothing risky, run it with
+  `--apply` and tell the user in one line. Otherwise show the user your
+  concerns and ask.
+- **After `--apply` succeeds:** re-read this SKILL.md before continuing.
+- **It reports a migration conflict:** show the user the conflicting files
+  and wait for them to choose which version to keep.
+
 ## Rules for every Slack task
 
 1. **Use this CLI for all Slack work.** It covers every configured workspace; leave any Slack MCP connector unused, even when one is available.
@@ -19,7 +40,7 @@ $SLACK help   # every command and flag
 3. **Read a shared link in full before acting on it** (next section).
 4. **Attribute messages to resolved names** (see "User ID resolution").
 
-If `config.json` is missing, a workspace needs adding, or a command fails with `invalid_auth`, follow [references/setup.md](references/setup.md).
+User data lives in the data folder, `~/.config/hartreeworks-skills/slack/`, outside the skill folder so updates keep it: `config.json` (tokens and settings), the name caches, session state and digests. If `config.json` is missing there, a workspace needs adding, or a command fails with `invalid_auth`, follow [references/setup.md](references/setup.md).
 
 ## Reading a Slack link
 
@@ -38,7 +59,7 @@ The linked message is rarely the whole story: the parent frames the question, an
 Slack returns user IDs (`U0123456789`), not names. Attributing a message from context clues or writing style spreads misinformation, so every name you present comes from a lookup.
 
 - `read-link` output, and `history`, `replies` and `search` with `--resolve`, carry `user_name`, a local `time` and readable mentions. Use these for anything you will read or summarise.
-- The client caches user and channel names per workspace in `data/slack-cache-<workspace>.json`, looks up each unknown ID once (Slack Connect and deactivated users included), and refreshes the user list in the background after 14 days.
+- The client caches user and channel names per workspace in the data folder's `slack-cache-<workspace>.json`, looks up each unknown ID once (Slack Connect and deactivated users included), and refreshes the user list in the background after 14 days.
 - With raw output, run `$SLACK -w <workspace> user-lookup` first for the `user_id → name` map. An ID that still has no name is shown as the ID, with a note.
 
 ---
@@ -145,8 +166,8 @@ multiSelect: false
 
 ## Workspaces and channels
 
-- Each workspace has a cache at `data/slack-cache-<workspace>.json`. Its `channel_names` map (`channel_id → name`) fills in as channels are read or listed; search it for a channel's ID before listing channels with `$SLACK -w <workspace> channels "public_channel,private_channel"`.
-- `session-state.json` records which workspace each channel ID belongs to; that is how channel commands infer `-w`.
+- Each workspace has a cache at `slack-cache-<workspace>.json` in the data folder. Its `channel_names` map (`channel_id → name`) fills in as channels are read or listed; search it for a channel's ID before listing channels with `$SLACK -w <workspace> channels "public_channel,private_channel"`.
+- `session-state.json` in the data folder records which workspace each channel ID belongs to; that is how channel commands infer `-w`.
 - `channels [types]` takes a comma-separated list of `public_channel`, `private_channel`, `im` (DMs) and `mpim` (group DMs).
 - When the user names a channel that could be in more than one workspace, ask which with AskUserQuestion, then pass `-w`.
 
@@ -336,7 +357,7 @@ After generating the digest, write `~/.agents/skills/slack/last-digest.json`:
 
 When user says "open 1.2" or "open message 2.1":
 
-1. Read `config.json` to get `link_style` preference
+1. Read the data folder's `config.json` to get `link_style` preference
 2. Read `last-digest.json` and look up the message reference (includes workspace)
 3. Generate permalink using the `permalink` command with the user's link_style:
    ```bash

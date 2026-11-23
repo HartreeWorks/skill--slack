@@ -16,6 +16,11 @@ is_usable_python() {
   "$candidate" -c 'import requests' >/dev/null 2>&1 || return 1
 }
 
+# Move a legacy data/ folder out of the skill folder before first use (update-check installs).
+if [[ -f "$SKILL_ROOT/scripts/data-dir.sh" ]]; then
+  bash "$SKILL_ROOT/scripts/data-dir.sh" >/dev/null || exit 1
+fi
+
 if is_usable_python "$VENV_PY"; then
   exec "$VENV_PY" "$CLIENT" "$@"
 fi

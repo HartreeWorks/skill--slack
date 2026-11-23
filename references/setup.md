@@ -4,12 +4,12 @@ Use this when `config.json` is missing, a workspace needs adding, or tokens have
 
 ## First-time setup flow
 
-If `config.json` is missing when running a Slack command, walk the user through setup:
+If `config.json` is missing from the data folder (`~/.config/hartreeworks-skills/slack/`) when running a Slack command, walk the user through setup:
 
 1. **Create config file:**
    ```bash
-   cd ~/.agents/skills/slack
-   cp config.example.json config.json
+   mkdir -p ~/.config/hartreeworks-skills/slack
+   cp <this skill's folder>/config.example.json ~/.config/hartreeworks-skills/slack/config.json
    ```
 
 2. **Guide user to extract browser tokens:**
