@@ -3,7 +3,8 @@
     "your-workspace": {
       "xoxc_token": "xoxc-YOUR-XOXC-TOKEN-HERE",
       "xoxd_token": "xoxd-YOUR-XOXD-TOKEN-HERE",
-      "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+      "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "chrome_profile": "Profile 1"
     }
   },
   "link_style": "app"

@@ -134,7 +134,8 @@ multiSelect: false
 - `replies <channel> <thread_ts>` needs the thread parent's ts. Given a reply's ts, Slack returns only that reply, and the output carries a `warning` naming the parent ts. Take `thread_ts` from a link's query string, or use `read-link`.
 - `history <channel> [limit] --with-replies` attaches each thread's replies to its parent, in one call.
 - `--resolve` output has one shape: `{ok, _workspace, channel, messages: [...]}`, oldest first for `history`; `search` adds `channel` and `permalink` to each message. Without it, output is the Slack API's raw JSON.
-- `mark-read` moves the user's read cursor, so run it only with their go-ahead.
+- `mark-read` (channels and DMs) and `mark-thread-read` (followed threads) move the user's read cursor, so run them only with their go-ahead. Both move it forward only; marking a channel read leaves its threads' replies unread.
+- `focus` pauses or resumes the user's notifications in one workspace and sets the "🔭 In focus mode" status, imitating Slack's focus mode, which has no API. Colleagues see both. `off` ends any current pause, including one set by the user's notification schedule, so don't run it during scheduled quiet hours unless asked.
 - Always call the launcher. It uses `.venv/bin/python` when healthy and falls back to `python3`; if neither has `requests`, repair the virtualenv:
 
   ```bash
@@ -150,6 +151,12 @@ multiSelect: false
 - When the user names a channel that could be in more than one workspace, ask which with AskUserQuestion, then pass `-w`.
 
 ## Workflow 1: send a message
+
+If you have a writing-style skill, load it before drafting any message sent as the user.
+
+Show the user the exact final text and send only once they have approved that text; an instruction to message someone is not approval.
+
+`send` starts every message with `[agent] ` (unless the text already does), so readers can tell it from the user's own posts under their name; when the first line is a bold title, the prefix goes inside the bold (`*[agent] Title*`). Don't add it yourself. Drafts carry no prefix: the user sends them themselves.
 
 ### To a channel
 
@@ -182,6 +189,15 @@ multiSelect: false
    ```bash
    $SLACK -w <workspace> send "D0123456789" "Your DM message"
    ```
+
+### As an unsent draft
+
+To leave a message in a channel's message box for the person to check and send themselves, write it to a `.txt` file in Slack mrkdwn and run `$SLACK -w <workspace> draft "C0123456789" message.txt --open`. It converts the text to rich_text (`*bold*`, `_italic_`, `~strike~`, `` `code` ``, `__underline__`, `<@U…>` mentions, `<url|text>` and bare links, `•` lists (numbered lines stay plain text, never Slack's numbered-list element), ```` ``` ```` fenced code blocks kept verbatim), saves the draft, prints the conversation's `url` and, with `--open`, opens it in Chrome, in the profile named by the workspace's `chrome_profile` in `config.json` (a directory such as `Profile 9`; plain `open` when unset). `--thread <parent ts>` puts the draft in that thread's reply box instead, and the `url` opens the thread. `--file <path>` (repeatable) attaches a file, such as a screenshot: it is uploaded unshared and appears in the draft, so nobody sees it until the person sends. It prints the `draft_id`, `channel` and any `thread_ts`; keep the id. A `.json` file of `rich_text` blocks is sent as it is. Use a draft for anything with @-mentions or formatting the person will paste: mentions stay real and underline survives, which neither a paste nor a sent mrkdwn message manages. Creating a draft posts nothing, attachments included, so it needs no send approval. For a DM, find the channel ID with `user-lookup` (the user's ID), then `channels im` (the `id` whose `user` matches). Make one draft per message: a second call for the same channel may clash with the draft already in its message box.
+
+Drafts you make are yours to clean up; never leave stale ones for the user to delete:
+- When a drafted message changes, edit it in place: `draft-edit <draft_id> <file> [--open]` replaces the text (same file formats as `draft`), keeping its conversation, thread and attachments. Don't make a second draft.
+- Delete a superseded or abandoned draft with `draft-delete <draft_id>`.
+- If the id is lost, `drafts [channel]` lists unsent drafts, newest first, with `draft_id`, `channel`, `thread_ts`, `updated` and the first 80 characters. It lists the user's own drafts too: touch only ones you made.
 
 ### Message formatting
 
@@ -486,14 +502,14 @@ For 6 months of active usage:
 
 ## Known limitations
 
-### No activity feed / unread notifications
+### No activity feed
 
-The Slack Activity feed API is not available. Cannot directly fetch:
+The Slack Activity feed API is not available, so the skill cannot fetch the mentions-and-reactions feed, its badge count, or reactions to the user's messages. To find mentions, search for the user's ID: `<@USER_ID>`.
 
-- Unread notification count
-- Reactions to user's messages
+Read state is available. Slack keeps a read cursor (`last_read`) per conversation and per followed thread; every message newer than the cursor is unread:
 
-Workarounds:
-- Search for messages mentioning the user's ID: `<@USER_ID>`
-- Search for recent activity in user's DMs
-- Check specific channels for recent messages
+- `counts`: each channel's and DM's `last_read`, latest timestamp and unread flag, in one call.
+- `info <channel>`: one channel's `last_read`.
+- `thread-view`: each followed thread's `last_read` and `latest_reply`. Threads the user doesn't follow have no cursor of their own here.
+
+To list unread messages, take the flagged conversations and threads and fetch the messages after each cursor. `mark-read` and `mark-thread-read` move these cursors.
