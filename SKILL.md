@@ -156,6 +156,7 @@ multiSelect: false
 - `history <channel> [limit] --with-replies` attaches each thread's replies to its parent, in one call.
 - `--resolve` output has one shape: `{ok, _workspace, channel, messages: [...]}`, oldest first for `history`; `search` adds `channel` and `permalink` to each message. Without it, output is the Slack API's raw JSON.
 - `mark-read` (channels and DMs) and `mark-thread-read` (followed threads) move the user's read cursor, so run them only with their go-ahead. Both move it forward only; marking a channel read leaves its threads' replies unread.
+- `todo-update` ticks (`--done`), unticks (`--undone`), sets the due date of (`--due <epoch>`) or snoozes (`--snooze <epoch>`) an item (`0` clears either date) on the user's To-dos list, by the channel and ts that `todos` lists. Only the user's own list changes; run it only with their go-ahead.
 - `focus` pauses or resumes the user's notifications in one workspace and sets the "🔭 In focus mode" status, imitating Slack's focus mode, which has no API. Colleagues see both. `off` ends any current pause, including one set by the user's notification schedule, so don't run it during scheduled quiet hours unless asked.
 - Always call the launcher. It uses `.venv/bin/python` when healthy and falls back to `python3`; if neither has `requests`, repair the virtualenv:
 

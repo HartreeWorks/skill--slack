@@ -320,6 +320,22 @@ class SlackClient:
         result["saved_items"] = items
         return result
 
+    def saved_update(self, channel: str, ts: str, mark: str = None, date_due: int = None,
+                     snoozed_until: int = None) -> dict:
+        """Change one item on the Later / To-dos list.
+
+        Internal web-client endpoint. `mark` is `completed` or `uncompleted`;
+        `date_due` and `snoozed_until` are epoch seconds, or 0 to clear them. Returns the item.
+        """
+        data = {"item_type": "message", "item_id": channel, "ts": ts}
+        if mark:
+            data["mark"] = mark
+        if date_due is not None:
+            data["date_due"] = str(int(date_due))
+        if snoozed_until is not None:
+            data["date_snoozed_until"] = str(int(snoozed_until))
+        return self._post("saved.update", data)
+
     def conversations_mark(self, channel: str, message_ts: str) -> dict:
         """Move the authenticated user's read cursor through a channel timestamp."""
         return self._post("conversations.mark", {
@@ -1934,6 +1950,10 @@ Reading
   todos [--all]                     The To-dos (Later) list: items in progress, with due
                                     dates. --all keeps the completed and archived items
                                     Slack returns too.
+  todo-update <channel> <ts> (--done | --undone | --due <epoch> | --snooze <epoch>)
+                                    Tick, untick, reschedule or snooze a To-dos item
+                                    (epoch seconds; 0 clears the date). Only
+                                    Peter's own list changes; nobody is notified.
   info <channel> | counts | download <url> <output_path> [max_bytes]
 
   --resolve (history, replies, search): slim messages with names, local times and
@@ -2545,6 +2565,29 @@ def main():
                 if "--all" not in cmd_args:
                     result["saved_items"] = [i for i in result["saved_items"]
                                              if i.get("state") == "in_progress"]
+
+        elif command == "todo-update":
+            rest = list(cmd_args)
+            usage = {"error": "Usage: todo-update <channel> <ts> (--done | --undone | --due <epoch|0> | --snooze <epoch|0>)"}
+            if len(rest) < 3 or not re.fullmatch(r"[A-Z][A-Z0-9]+", rest[0]) \
+                    or not re.fullmatch(r"\d{10,}\.\d{6}", rest[1]):
+                print(json.dumps(usage))
+                sys.exit(1)
+            channel, message_ts, flags = rest[0], rest[1], rest[2:]
+            if flags == ["--done"]:
+                result = client.saved_update(channel, message_ts, mark="completed")
+            elif flags == ["--undone"]:
+                result = client.saved_update(channel, message_ts, mark="uncompleted")
+            elif len(flags) == 2 and flags[0] == "--due" and flags[1].isdigit():
+                result = client.saved_update(channel, message_ts, date_due=int(flags[1]))
+            elif len(flags) == 2 and flags[0] == "--snooze" and flags[1].isdigit():
+                result = client.saved_update(channel, message_ts, snoozed_until=int(flags[1]))
+            else:
+                print(json.dumps(usage))
+                sys.exit(1)
+            if result.get("ok"):
+                set_active_workspace(ws_name)
+                result["_workspace"] = ws_name
 
         elif command == "mark-read":
             if len(cmd_args) != 3 or cmd_args[2] != "--confirm":
