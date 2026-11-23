@@ -1,6 +1,6 @@
 # Slack
 
-A skill for searching, reading and sending Slack messages from your agent across multiple workspaces. Paste a Slack link and your agent reads the whole thread around it, with names and times filled in. It also handles shared Slack Connect channels, digests and message exports.
+A skill for searching, reading and sending Slack messages from your agent across multiple workspaces. Paste a Slack link and your agent reads the whole thread around it, with names and times filled in. It can leave a message as an unsent draft in Slack for you to check and send, see which channels and threads have unread messages, and mark them read. It also handles shared Slack Connect channels, digests and message exports.
 
 ## Requirements
 
